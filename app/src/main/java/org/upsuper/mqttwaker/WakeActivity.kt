@@ -75,6 +75,12 @@ class WakeActivity : AppCompatActivity() {
         finish()
     }
 
+    override fun onStop() {
+        super.onStop()
+        // A browser or another application may have taken focus before the timer fires.
+        closeActivity()
+    }
+
     override fun onDestroy() {
         super.onDestroy()
         autoCloseRunnable?.let { handler.removeCallbacks(it) }

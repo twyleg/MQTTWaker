@@ -7,6 +7,7 @@ import android.graphics.PixelFormat
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
 import android.provider.Settings
 import android.util.Log
 import android.view.Gravity
@@ -19,7 +20,12 @@ class ScreenWakeService : Service() {
         private const val TAG = "ScreenWakeService"
     }
     private lateinit var windowManager: WindowManager
-    private lateinit var overlayView: FrameLayout
+    private var overlayView: FrameLayout? = null
+    private val handler = Handler(Looper.getMainLooper())
+    private val cleanup = Runnable {
+        removeOverlay()
+        stopSelf()
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -29,69 +35,74 @@ class ScreenWakeService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Log.d(TAG, "Screen wake service started")
 
+        if (overlayView != null) {
+            Log.d(TAG, "Ignoring wake command: overlay already active")
+            return START_NOT_STICKY
+        }
+        if ((getSystemService(Context.POWER_SERVICE) as PowerManager).isInteractive) {
+            Log.d(TAG, "Ignoring wake command: device already interactive")
+            stopSelf(startId)
+            return START_NOT_STICKY
+        }
         if (!Settings.canDrawOverlays(this)) {
             Log.e(TAG, "No permission to draw overlays")
-            stopSelf()
+            stopSelf(startId)
             return START_NOT_STICKY
         }
 
         try {
-            overlayView = FrameLayout(this)
-
+            val view = FrameLayout(this)
             val params = LayoutParams(
                 LayoutParams.MATCH_PARENT,
                 LayoutParams.MATCH_PARENT,
                 LayoutParams.TYPE_APPLICATION_OVERLAY,
                 LayoutParams.FLAG_KEEP_SCREEN_ON or
                         LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                        LayoutParams.FLAG_NOT_FOCUSABLE,
+                        LayoutParams.FLAG_NOT_FOCUSABLE or
+                        LayoutParams.FLAG_NOT_TOUCHABLE,
                 PixelFormat.TRANSLUCENT
-            )
-            params.gravity = Gravity.CENTER
+            ).apply {
+                gravity = Gravity.CENTER
+                // Android 12+ allows touch-through for fully transparent overlay windows.
+                alpha = 0f
+            }
 
-            windowManager.addView(overlayView, params)
+            windowManager.addView(view, params)
+            overlayView = view
+            Log.d(TAG, "Wake overlay created")
 
-            // Start WakeActivity
             val wakeIntent = Intent(this, WakeActivity::class.java).apply {
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
             }
             startActivity(wakeIntent)
 
-            // Remove the overlay view after a short delay
-            Handler(Looper.getMainLooper()).postDelayed({
-                removeOverlayAndStop()
-            }, 3000)
-
+            handler.removeCallbacks(cleanup)
+            handler.postDelayed(cleanup, 3000)
         } catch (e: Exception) {
-            Log.e(TAG, "Error showing overlay", e)
-            stopSelf()
+            Log.e(TAG, "Error showing wake overlay", e)
+            handler.removeCallbacks(cleanup)
+            removeOverlay()
+            stopSelf(startId)
         }
 
         return START_NOT_STICKY
     }
 
-    private fun removeOverlayAndStop() {
+    private fun removeOverlay() {
+        val view = overlayView ?: return
         try {
-            if (::overlayView.isInitialized) {
-                windowManager.removeView(overlayView)
-            }
+            windowManager.removeViewImmediate(view)
+            Log.d(TAG, "Wake overlay removed")
+            overlayView = null
         } catch (e: Exception) {
-            // Ignore
-        } finally {
-            stopSelf()
+            Log.e(TAG, "Failed to remove wake overlay", e)
         }
     }
 
     override fun onDestroy() {
+        handler.removeCallbacks(cleanup)
+        removeOverlay()
         super.onDestroy()
-        if (::overlayView.isInitialized) {
-            try {
-                windowManager.removeView(overlayView)
-            } catch (e: Exception) {
-                // Ignore
-            }
-        }
     }
 
     override fun onBind(intent: Intent?): IBinder? = null

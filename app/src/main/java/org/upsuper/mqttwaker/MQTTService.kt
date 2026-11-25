@@ -218,6 +218,11 @@ class MQTTService : Service() {
     private fun wakeScreen() {
         Log.d(TAG, "Wake screen command received")
 
+        if ((getSystemService(Context.POWER_SERVICE) as PowerManager).isInteractive) {
+            Log.d(TAG, "Ignoring ON command: device already interactive")
+            return
+        }
+
         try {
             // Show a notification that we're waking the screen
             updateNotification("Waking screen")
