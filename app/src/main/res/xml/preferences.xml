@@ -61,6 +61,12 @@
             app:useSimpleSummaryProvider="true" />
     </PreferenceCategory>
 
+    <PreferenceCategory android:title="Power Management">
+        <SwitchPreferenceCompat android:key="prevent_cpu_sleep" android:title="Prevent CPU sleep"
+            android:summary="Keep the CPU awake while the MQTT service runs; increases power consumption" android:defaultValue="false" />
+        <Preference android:key="battery_optimization" android:title="Battery optimization" />
+    </PreferenceCategory>
+
     <PreferenceCategory android:title="Service Control">
         <SwitchPreferenceCompat
             android:key="service_enabled"

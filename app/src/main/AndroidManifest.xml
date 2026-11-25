@@ -51,7 +51,6 @@
             </intent-filter>
         </receiver>
 
-        <service android:name="info.mqtt.android.service.MqttService" />
 
         <receiver
             android:name=".MQTTWakerDeviceAdminReceiver"

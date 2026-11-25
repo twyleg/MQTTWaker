@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.os.PowerManager
 import android.provider.Settings
 import android.util.Log
 import android.widget.Toast
@@ -87,23 +88,18 @@ class MainActivity : AppCompatActivity() {
             uri?.let { selectedUri ->
                 // Save the certificate URI in preferences
                 val prefs = PreferenceManager.getDefaultSharedPreferences(requireContext())
-                prefs.edit {
-                    putString("mqtt_ssl_cert_uri", selectedUri.toString())
-                }
-
                 try {
                     // Request persistent permission to read this file
                     requireContext().contentResolver.takePersistableUriPermission(
                         selectedUri,
                         Intent.FLAG_GRANT_READ_URI_PERMISSION
                     )
+                    prefs.edit { putString("mqtt_ssl_cert_uri", selectedUri.toString()) }
                     Log.d("MainActivity", "Persistent permission granted for URI: $selectedUri")
 
                     // Update the summary to show the selected file name
                     updateCertificateSummary(selectedUri)
 
-                    // Restart service if it's running to apply the new certificate
-                    restartServiceIfRunning()
                 } catch (e: SecurityException) {
                     Log.e("MainActivity", "Failed to take persistable permission", e)
                     Toast.makeText(requireContext(),
@@ -115,6 +111,11 @@ class MainActivity : AppCompatActivity() {
 
         override fun onCreatePreferences(savedInstanceState: Bundle?, rootKey: String?) {
             setPreferencesFromResource(R.xml.preferences, rootKey)
+
+            findPreference<Preference>("battery_optimization")?.setOnPreferenceClickListener {
+                startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                true
+            }
 
             // Service enable/disable handler
             findPreference<SwitchPreferenceCompat>("service_enabled")?.setOnPreferenceChangeListener { _, newValue ->
@@ -163,10 +164,17 @@ class MainActivity : AppCompatActivity() {
 
             // Option to use custom certificate listener
             findPreference<SwitchPreferenceCompat>("mqtt_ssl_use_custom_cert")?.setOnPreferenceChangeListener { _, _ ->
-                // Restart service if it's running to apply the certificate settings change
-                restartServiceIfRunning()
+                // The running service observes the preference change.
                 true
             }
+        }
+
+        override fun onResume() {
+            super.onResume()
+            val power = requireContext().getSystemService(Context.POWER_SERVICE) as PowerManager
+            findPreference<Preference>("battery_optimization")?.summary =
+                if (power.isIgnoringBatteryOptimizations(requireContext().packageName)) "Exempt from battery optimization"
+                else "Not exempt from battery optimization"
         }
 
         private fun updateCertificateSummary(uri: Uri) {
@@ -202,15 +210,5 @@ class MainActivity : AppCompatActivity() {
             return null
         }
 
-        private fun restartServiceIfRunning() {
-            val prefs = PreferenceManager.getDefaultSharedPreferences(requireContext())
-            val isServiceEnabled = prefs.getBoolean("service_enabled", false)
-
-            if (isServiceEnabled) {
-                val serviceIntent = Intent(requireContext(), MQTTService::class.java)
-                requireContext().stopService(serviceIntent)
-                requireContext().startService(serviceIntent)
-            }
-        }
     }
 }

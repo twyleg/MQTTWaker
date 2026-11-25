@@ -39,8 +39,7 @@ dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.appcompat)
     implementation(libs.material)
-    // Modern MQTT implementation with Android 12+ compatibility
-    implementation("com.github.hannesa2:paho.mqtt.android:3.5.2")
+    implementation("org.eclipse.paho:org.eclipse.paho.client.mqttv3:1.2.5")
     implementation("androidx.preference:preference-ktx:1.2.1")
     implementation("androidx.lifecycle:lifecycle-service:2.6.2")
 
