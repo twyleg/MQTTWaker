@@ -47,13 +47,15 @@ class MQTTService : Service() {
     }
 
     private var mqttClient: MqttAsyncClient? = null
+    @Volatile private var stopping = false
     private var generation = 0
     private var connecting = false
     private var wakeLock: PowerManager.WakeLock? = null
     private lateinit var prefs: SharedPreferences
     private val preferenceListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
         if (key == "prevent_cpu_sleep") updateWakeLock()
-        else if (key != "service_enabled" && key != "mqtt_generated_client_id") {
+        else if (key in setOf("mqtt_server", "mqtt_sub_topic", "mqtt_pub_topic", "mqtt_username",
+                "mqtt_password", "mqtt_client_id", "mqtt_ssl_use_custom_cert", "mqtt_ssl_cert_uri")) {
             worker.execute { replaceClient() }
         }
     }
@@ -89,6 +91,7 @@ class MQTTService : Service() {
 
     override fun onDestroy() {
         Log.i(TAG, "Foreground service destroyed")
+        stopping = true
         prefs.unregisterOnSharedPreferenceChangeListener(preferenceListener)
         unregisterScreenStateReceiver()
         releaseWakeLock()
@@ -137,6 +140,7 @@ class MQTTService : Service() {
     }
 
     private fun replaceClient() {
+        if (stopping) return
         destroyClient()
         loadSettings()
         if (serverUri.isBlank() || subscribeTopic.isBlank()) {
@@ -151,7 +155,7 @@ class MQTTService : Service() {
             client.setCallback(object : MqttCallbackExtended {
                 override fun connectComplete(reconnect: Boolean, serverURI: String) {
                     worker.execute {
-                        if (current != generation) return@execute
+                        if (stopping || current != generation) return@execute
                         connecting = false
                         Log.i(TAG, "MQTT connected (reconnect=$reconnect) to $serverURI")
                         updateNotification("Connected to MQTT broker")
@@ -170,7 +174,7 @@ class MQTTService : Service() {
                 override fun messageArrived(topic: String, message: MqttMessage) {
                     val payload = String(message.payload)
                     worker.execute {
-                        if (current != generation) return@execute
+                        if (stopping || current != generation) return@execute
                         Log.d(TAG, "Message received on $topic: $payload")
                         when (payload.trim().uppercase()) {
                             "ON" -> wakeScreen()
@@ -182,7 +186,9 @@ class MQTTService : Service() {
             })
             val options = MqttConnectOptions().apply {
                 isAutomaticReconnect = true
-                isCleanSession = false
+                // A fresh broker session prevents subscriptions from an old topic or
+                // configuration surviving replacement of this client.
+                isCleanSession = true
                 keepAliveInterval = 60
                 if (username.isNotBlank()) {
                     userName = username
@@ -202,7 +208,7 @@ class MQTTService : Service() {
     }
 
     private fun connect(client: MqttAsyncClient, options: MqttConnectOptions, current: Int) {
-        if (current != generation || connecting || client.isConnected) return
+        if (stopping || current != generation || connecting || client.isConnected) return
         connecting = true
         Log.i(TAG, "Connecting MQTT client $clientId")
         try {
@@ -212,7 +218,7 @@ class MQTTService : Service() {
                     Log.e(TAG, "MQTT connection failed; retrying", error)
                     try {
                         worker.schedule({
-                            if (current == generation) {
+                            if (!stopping && current == generation) {
                                 connecting = false
                                 connect(client, options, current)
                             }
