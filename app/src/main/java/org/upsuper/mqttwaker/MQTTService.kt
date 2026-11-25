@@ -17,9 +17,11 @@ import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.preference.PreferenceManager
-import info.mqtt.android.service.MqttAndroidClient
-import info.mqtt.android.service.QoS
-import org.eclipse.paho.client.mqttv3.DisconnectedBufferOptions
+import org.eclipse.paho.client.mqttv3.MqttAsyncClient
+import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence
+import android.content.SharedPreferences
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import org.eclipse.paho.client.mqttv3.IMqttActionListener
 import org.eclipse.paho.client.mqttv3.IMqttDeliveryToken
 import org.eclipse.paho.client.mqttv3.IMqttToken
@@ -41,10 +43,20 @@ class MQTTService : Service() {
         private const val CHANNEL_ID = "mqtt_waker_channel"
         private const val SCREEN_STATE_ON = "ON"
         private const val SCREEN_STATE_OFF = "OFF"
+        private val worker = Executors.newSingleThreadScheduledExecutor()
     }
 
-    private lateinit var mqttClient: MqttAndroidClient
-    private var isConnected = false
+    private var mqttClient: MqttAsyncClient? = null
+    private var generation = 0
+    private var connecting = false
+    private var wakeLock: PowerManager.WakeLock? = null
+    private lateinit var prefs: SharedPreferences
+    private val preferenceListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+        if (key == "prevent_cpu_sleep") updateWakeLock()
+        else if (key != "service_enabled" && key != "mqtt_generated_client_id") {
+            worker.execute { replaceClient() }
+        }
+    }
     private var serverUri = ""
     private var subscribeTopic = ""
     private var publishTopic = ""
@@ -60,21 +72,27 @@ class MQTTService : Service() {
         super.onCreate()
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, createNotification("MQTT Waker Service Starting"))
+        Log.i(TAG, "Foreground service created")
+        prefs = PreferenceManager.getDefaultSharedPreferences(this)
+        prefs.registerOnSharedPreferenceChangeListener(preferenceListener)
+        updateWakeLock()
         registerScreenStateReceiver()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Log.d(TAG, "onStartCommand called with action: ${intent?.action}")
-        loadSettings()
-        connectToMqttBroker()
+        worker.execute { if (mqttClient == null) replaceClient() }
         return START_STICKY
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
+        Log.i(TAG, "Foreground service destroyed")
+        prefs.unregisterOnSharedPreferenceChangeListener(preferenceListener)
         unregisterScreenStateReceiver()
-        disconnectMqtt()
+        releaseWakeLock()
+        worker.execute { destroyClient() }
         super.onDestroy()
     }
 
@@ -91,7 +109,9 @@ class MQTTService : Service() {
         customCertUri = prefs.getString("mqtt_ssl_cert_uri", null)?.toUri()
 
         if (clientId.isBlank()) {
-            clientId = "MQTTWaker_" + UUID.randomUUID().toString()
+            clientId = prefs.getString("mqtt_generated_client_id", null) ?: ("MQTTWaker_" + UUID.randomUUID().toString()).also {
+                prefs.edit().putString("mqtt_generated_client_id", it).commit()
+            }
         }
 
         Log.d(
@@ -100,119 +120,125 @@ class MQTTService : Service() {
         )
     }
 
-    private fun connectToMqttBroker() {
+    private fun updateWakeLock() {
+        if (prefs.getBoolean("prevent_cpu_sleep", false)) {
+            if (wakeLock?.isHeld != true) {
+                wakeLock = (getSystemService(Context.POWER_SERVICE) as PowerManager)
+                    .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "$packageName:MQTTService")
+                    .apply { setReferenceCounted(false); acquire() }
+                Log.i(TAG, "Partial wake lock acquired")
+            }
+        } else releaseWakeLock()
+    }
+
+    private fun releaseWakeLock() {
+        wakeLock?.let { if (it.isHeld) { it.release(); Log.i(TAG, "Partial wake lock released") } }
+        wakeLock = null
+    }
+
+    private fun replaceClient() {
+        destroyClient()
+        loadSettings()
         if (serverUri.isBlank() || subscribeTopic.isBlank()) {
-            Log.e(TAG, "MQTT server or topic not configured")
             updateNotification("Error: MQTT server or topic not configured")
             return
         }
-
-        mqttClient = MqttAndroidClient(applicationContext, serverUri, clientId)
-        mqttClient.setCallback(object : MqttCallbackExtended {
-            override fun connectComplete(reconnect: Boolean, serverURI: String) {
-                isConnected = true
-                Log.d(TAG, "Connected to MQTT broker: $serverURI")
-                updateNotification("Connected to MQTT broker")
-                subscribeToTopic()
-                publishInitialScreenState()
-            }
-
-            override fun connectionLost(cause: Throwable?) {
-                isConnected = false
-                Log.e(TAG, "Connection lost to MQTT broker", cause)
-                updateNotification("Connection lost to MQTT broker")
-            }
-
-            override fun messageArrived(topic: String, message: MqttMessage) {
-                // This is not called since we use a message listener when subscribing
-            }
-
-            override fun deliveryComplete(token: IMqttDeliveryToken) {
-                // Not used for subscription-only client
-            }
-        })
-
-        val connectOptions = MqttConnectOptions().apply {
-            isAutomaticReconnect = true
-            isCleanSession = false
-
-            if (username.isNotBlank()) {
-                userName = username
-                password = this@MQTTService.password.toCharArray()
-            }
-
-            // Configure SSL if the serverUri starts with ssl://
-            if (serverUri.startsWith("ssl://")) {
-                try {
-                    // Create SSL socket factory
-                    val sslContext = if (useCustomCert && customCertUri != null) {
-                        try {
-                            createCustomSSLContext(customCertUri!!)
-                        } catch (se: SecurityException) {
-                            Log.e(TAG, "Security exception accessing certificate", se)
-                            updateNotification("Cannot access certificate: permission denied")
-                            // Fall back to system certificates
-                            SSLContext.getInstance("TLS")
-                        } catch (ce: Exception) {
-                            Log.e(TAG, "Error loading custom certificate", ce)
-                            updateNotification("Certificate error: ${ce.message}")
-                            // Fall back to system certificates
-                            SSLContext.getInstance("TLS")
-                        }
-                    } else {
-                        SSLContext.getInstance("TLS")
-                    }
-
-                    socketFactory = sslContext.socketFactory
-                    Log.d(TAG, "SSL configured for MQTT connection")
-                } catch (e: Exception) {
-                    Log.e(TAG, "Failed to configure SSL", e)
-                    updateNotification("Failed to configure SSL: ${e.message}")
-                }
-            }
-        }
-
         try {
-            mqttClient.connect(connectOptions, null, object : IMqttActionListener {
-                override fun onSuccess(asyncActionToken: IMqttToken) {
-                    val disconnectedBufferOptions = DisconnectedBufferOptions().apply {
-                        isBufferEnabled = true
-                        bufferSize = 100
-                        isPersistBuffer = false
-                        isDeleteOldestMessages = false
+            val client = MqttAsyncClient(serverUri, clientId, MemoryPersistence())
+            mqttClient = client
+            val current = generation
+            Log.i(TAG, "MQTT client initialized: $clientId")
+            client.setCallback(object : MqttCallbackExtended {
+                override fun connectComplete(reconnect: Boolean, serverURI: String) {
+                    worker.execute {
+                        if (current != generation) return@execute
+                        connecting = false
+                        Log.i(TAG, "MQTT connected (reconnect=$reconnect) to $serverURI")
+                        updateNotification("Connected to MQTT broker")
+                        try {
+                            client.subscribe(subscribeTopic, 0, null, object : IMqttActionListener {
+                                override fun onSuccess(token: IMqttToken) { Log.i(TAG, "Subscribed to $subscribeTopic") }
+                                override fun onFailure(token: IMqttToken, error: Throwable) { Log.e(TAG, "Subscription failed", error) }
+                            })
+                        } catch (e: Exception) { Log.e(TAG, "Subscription failed", e) }
+                        publishInitialScreenState()
                     }
-                    mqttClient.setBufferOpts(disconnectedBufferOptions)
                 }
-
-                override fun onFailure(asyncActionToken: IMqttToken, exception: Throwable) {
-                    Log.e(TAG, "Failed to connect to MQTT broker", exception)
-                    updateNotification("Failed to connect to MQTT broker")
+                override fun connectionLost(cause: Throwable?) {
+                    Log.e(TAG, "MQTT connection lost; automatic reconnect will retry", cause)
                 }
+                override fun messageArrived(topic: String, message: MqttMessage) {
+                    val payload = String(message.payload)
+                    worker.execute {
+                        if (current != generation) return@execute
+                        Log.d(TAG, "Message received on $topic: $payload")
+                        when (payload.trim().uppercase()) {
+                            "ON" -> wakeScreen()
+                            "OFF" -> lockScreen()
+                        }
+                    }
+                }
+                override fun deliveryComplete(token: IMqttDeliveryToken) = Unit
             })
+            val options = MqttConnectOptions().apply {
+                isAutomaticReconnect = true
+                isCleanSession = false
+                keepAliveInterval = 60
+                if (username.isNotBlank()) {
+                    userName = username
+                    password = this@MQTTService.password.toCharArray()
+                }
+                if (serverUri.startsWith("ssl://") && useCustomCert) {
+                    val uri = customCertUri ?: throw IllegalArgumentException("Custom certificate not selected")
+                    socketFactory = createCustomSSLContext(uri).socketFactory
+                }
+            }
+            connect(client, options, current)
         } catch (e: Exception) {
-            Log.e(TAG, "Error connecting to MQTT broker", e)
-            updateNotification("Error connecting to MQTT broker: ${e.message}")
+            Log.e(TAG, "MQTT initialization failed", e)
+            updateNotification("MQTT initialization failed")
+            destroyClient()
         }
     }
 
-    private fun subscribeToTopic() {
+    private fun connect(client: MqttAsyncClient, options: MqttConnectOptions, current: Int) {
+        if (current != generation || connecting || client.isConnected) return
+        connecting = true
+        Log.i(TAG, "Connecting MQTT client $clientId")
         try {
-            mqttClient.subscribe(subscribeTopic, QoS.AtMostOnce.value) { topic, message ->
-                val payload = String(message.payload)
-                Log.d(TAG, "Message received on topic $topic: $payload")
-
-                when (payload.trim().uppercase()) {
-                    "ON" -> wakeScreen()
-                    "OFF" -> lockScreen()
-                    else -> Log.d(TAG, "Unknown command: $payload")
+            client.connect(options, null, object : IMqttActionListener {
+                override fun onSuccess(token: IMqttToken) = Unit
+                override fun onFailure(token: IMqttToken, error: Throwable) {
+                    Log.e(TAG, "MQTT connection failed; retrying", error)
+                    try {
+                        worker.schedule({
+                            if (current == generation) {
+                                connecting = false
+                                connect(client, options, current)
+                            }
+                        }, 5, TimeUnit.SECONDS)
+                    } catch (_: java.util.concurrent.RejectedExecutionException) { }
                 }
-            }
-
-            updateNotification("Subscribed to topic: $subscribeTopic")
+            })
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to subscribe to topic", e)
-            updateNotification("Failed to subscribe to topic: ${e.message}")
+            connecting = false
+            Log.e(TAG, "MQTT connection attempt failed", e)
+            worker.schedule({ connect(client, options, current) }, 5, TimeUnit.SECONDS)
         }
+    }
+
+    private fun destroyClient() {
+        generation++
+        connecting = false
+        val client = mqttClient ?: return
+        mqttClient = null
+        try {
+            client.setCallback(null)
+            if (client.isConnected) client.disconnectForcibly(1000, 1000)
+            else client.disconnectForcibly(0, 0, false)
+        } catch (e: Exception) { Log.w(TAG, "Error disconnecting MQTT client", e) }
+        try { client.close(true) } catch (e: Exception) { Log.w(TAG, "Error closing MQTT client", e) }
+        Log.i(TAG, "MQTT client destroyed")
     }
 
     private fun wakeScreen() {
@@ -268,17 +294,6 @@ class MQTTService : Service() {
         }
     }
 
-    private fun disconnectMqtt() {
-        try {
-            if (::mqttClient.isInitialized && isConnected) {
-                mqttClient.disconnect()
-                Log.d(TAG, "Disconnected from MQTT broker")
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error disconnecting from MQTT broker", e)
-        }
-    }
-
     private fun createNotificationChannel() {
         val channel = NotificationChannel(
             CHANNEL_ID,
@@ -325,8 +340,8 @@ class MQTTService : Service() {
                 Log.d(TAG, "Received screen state broadcast: $action")
                 
                 when (action) {
-                    Intent.ACTION_SCREEN_ON -> publishScreenState(SCREEN_STATE_ON)
-                    Intent.ACTION_SCREEN_OFF -> publishScreenState(SCREEN_STATE_OFF)
+                    Intent.ACTION_SCREEN_ON -> worker.execute { publishScreenState(SCREEN_STATE_ON) }
+                    Intent.ACTION_SCREEN_OFF -> worker.execute { publishScreenState(SCREEN_STATE_OFF) }
                 }
             }
         }
@@ -340,7 +355,7 @@ class MQTTService : Service() {
     }
     
     private fun unregisterScreenStateReceiver() {
-        publishScreenState("");
+        worker.execute { publishScreenState("") }
         Log.d(TAG, "Unregistering screen state receiver")
         screenStateReceiver?.let {
             try {
@@ -363,18 +378,18 @@ class MQTTService : Service() {
     }
     
     private fun publishScreenState(state: String) {
-        Log.d(TAG, "Attempting to publish screen state: $state, connected: $isConnected, topic: $publishTopic")
-        if (!isConnected || publishTopic.isBlank()) {
+        val client = mqttClient
+        if (client?.isConnected != true || publishTopic.isBlank()) {
             Log.d(TAG, "Cannot publish screen state: not connected or topic not set")
             return
         }
         
         try {
             val message = MqttMessage(state.toByteArray())
-            message.qos = QoS.AtLeastOnce.value
+            message.qos = 1
             message.isRetained = true
 
-            mqttClient.publish(publishTopic, message)
+            client.publish(publishTopic, message)
             Log.d(TAG, "Published screen state '$state' to topic '$publishTopic'")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to publish screen state", e)
